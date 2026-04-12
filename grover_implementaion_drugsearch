@@ -1,0 +1,186 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import time
+from qiskit import QuantumCircuit
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+
+DRUG_DATABASE = {
+    "0000": ("Aspirin", 2244, "Cardiovascular", False),
+    "0001": ("Ibuprofen", 3672, "NSAID", False),
+    "0010": ("Metformin", 4091, "Diabetes", False),
+    "0011": ("Atorvastatin", 60754, "Cardiovascular", False),
+    "0100": ("Amoxicillin", 33613, "Antibiotic", False),
+    "0101": ("Omeprazole", 4594, "Gastroenterology", False),
+    "0110": ("Lisinopril", 5462, "Cardiovascular", False),
+    "0111": ("Sertraline", 5288826, "Neurology", False),
+    "1000": ("Ciprofloxacin", 2764, "Antibiotic", False),
+    "1001": ("Amlodipine", 2369, "Cardiovascular", False),
+    "1010": ("Metoprolol", 4171, "Cardiovascular", False),
+    "1011": ("CompoundX-EGFR", 5330286, "Oncology", True),
+    "1100": ("Gabapentin", 3446, "Neurology", False),
+    "1101": ("Pantoprazole", 4679, "Gastroenterology", False),
+    "1110": ("Losartan", 3961, "Cardiovascular", False),
+    "1111": ("Cetirizine", 2678, "Allergy", False),
+}
+
+TARGET_STATE = "1011"
+N_QUBITS = 4
+N = 2 ** N_QUBITS
+OPTIMAL_ITERS = max(1, int(np.pi / 4 * np.sqrt(N)))
+
+print("=" * 60)
+print("  GROVER'S ALGORITHM — QUANTUM DRUG SEARCH")
+print("  16 Compounds | 4 Qubits | Anti-Cancer Drug Target")
+print("=" * 60)
+print(f"\n  Database size    : {N} compounds")
+print(f"  Qubits           : {N_QUBITS}  (2^4 = 16 states)")
+print(f"  Target drug      : {DRUG_DATABASE[TARGET_STATE][0]}")
+print(f"  Target state     : |{TARGET_STATE}⟩  (index {int(TARGET_STATE,2)})")
+print(f"  Classical avg    : {N//2} queries   [O(N)]")
+print(f"  Quantum iters    : {OPTIMAL_ITERS} iterations [O(√N)]")
+
+def apply_oracle(circuit, n_qubits, target_state):
+    for i, bit in enumerate(reversed(target_state)):
+        if bit == '0':
+            circuit.x(i)
+
+    circuit.h(n_qubits - 1)
+    circuit.mcx(list(range(n_qubits - 1)), n_qubits - 1)
+    circuit.h(n_qubits - 1)
+
+    for i, bit in enumerate(reversed(target_state)):
+        if bit == '0':
+            circuit.x(i)
+
+def apply_diffusion(circuit, n_qubits):
+    circuit.h(range(n_qubits))
+    circuit.x(range(n_qubits))
+    circuit.h(n_qubits - 1)
+    circuit.mcx(list(range(n_qubits - 1)), n_qubits - 1)
+    circuit.h(n_qubits - 1)
+    circuit.x(range(n_qubits))
+    circuit.h(range(n_qubits))
+
+def build_grover_circuit(n_qubits, target_state, n_iterations):
+    qc = QuantumCircuit(n_qubits, n_qubits)
+    qc.h(range(n_qubits))
+    qc.barrier()
+
+    for iteration in range(n_iterations):
+        apply_oracle(qc, n_qubits, target_state)
+        qc.barrier()
+        apply_diffusion(qc, n_qubits)
+        qc.barrier()
+
+    qc.measure(range(n_qubits), range(n_qubits))
+    return qc
+
+def classical_linear_search(database, target_state):
+    queries = 0
+    start = time.perf_counter()
+    for state, info in database.items():
+        queries += 1
+        if state == target_state:
+            return queries, time.perf_counter() - start
+    return queries, time.perf_counter() - start
+
+print("\n" + "─" * 60)
+print("  RUNNING QUANTUM SIMULATION (Qiskit AerSimulator)")
+print("─" * 60)
+
+simulator = AerSimulator()
+SHOTS = 4096
+
+results_per_k = {}
+check_iters = [1, 2, 3, 4, 5]
+
+for k in check_iters:
+    qc = build_grover_circuit(N_QUBITS, TARGET_STATE, k)
+    counts = simulator.run(qc, shots=SHOTS).result().get_counts()
+    results_per_k[k] = counts
+
+    target_hits = counts.get(TARGET_STATE, 0)
+    probability = target_hits / SHOTS * 100
+    marker = "  ← OPTIMAL" if k == OPTIMAL_ITERS else ""
+    print(f"  k={k}: P(|{TARGET_STATE}⟩ = target) = {probability:6.2f}% ({target_hits}/{SHOTS} shots){marker}")
+
+optimal_counts = results_per_k[OPTIMAL_ITERS]
+q_success = optimal_counts.get(TARGET_STATE, 0) / SHOTS * 100
+
+c_queries, c_time = classical_linear_search(DRUG_DATABASE, TARGET_STATE)
+print(f"\n  Classical search : found in {c_queries} queries")
+print(f"  Quantum search   : found in {OPTIMAL_ITERS} iterations")
+print(f"  Speed advantage  : {c_queries/OPTIMAL_ITERS:.1f}x fewer oracle evaluations")
+print(f"  Quantum accuracy : {q_success:.1f}%  vs  Classical: 100% (after full scan)")
+
+def grover_prob_theory(k, N):
+    theta = np.arcsin(1 / np.sqrt(N))
+    return np.sin((2*k + 1) * theta)**2
+
+def classical_prob_at_k(k, N):
+    return min(1.0, k / N)
+
+CLASSICAL_COST_PER_QUERY = 1.0
+QUANTUM_COST_PER_ITER = 20.0
+
+def run_with_noise(error_rate, shots=1024):
+    nm = NoiseModel()
+    nm.add_all_qubit_quantum_error(depolarizing_error(error_rate, 1), ['h','x'])
+    nm.add_all_qubit_quantum_error(depolarizing_error(error_rate * 10, 2), ['cx'])
+    noisy_sim = AerSimulator(noise_model=nm)
+    qc = build_grover_circuit(N_QUBITS, TARGET_STATE, OPTIMAL_ITERS)
+    counts = noisy_sim.run(qc, shots=shots).result().get_counts()
+    return counts.get(TARGET_STATE, 0) / shots * 100
+
+print("\n  Running noise analysis...")
+noise_levels = [0.000, 0.001, 0.003, 0.005, 0.010, 0.020, 0.050]
+noise_results = [(e, run_with_noise(e, shots=1024)) for e in noise_levels]
+for err, prob in noise_results:
+    print(f"  Gate error {err:.3f}: P(target) = {prob:6.2f}%")
+
+scale_data = []
+for bits in range(2, 17):
+    n = 2 ** bits
+    c_avg = n // 2
+    q_iters = max(1, int(np.pi / 4 * np.sqrt(n)))
+    speed_adv = c_avg / q_iters
+    c_energy = c_avg * CLASSICAL_COST_PER_QUERY
+    q_energy = q_iters * QUANTUM_COST_PER_ITER
+    en_ratio = c_energy / q_energy
+    scale_data.append((n, bits, c_avg, q_iters, speed_adv, n, en_ratio))
+
+fig = plt.figure(figsize=(18, 14))
+gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.50, wspace=0.38)
+
+CQ = '#E74C3C'
+QQ = '#2980B9'
+TG = '#E74C3C'
+GN = '#27AE60'
+OR = '#F39C12'
+
+fig.suptitle(
+    "Grover's Algorithm — 4-Qubit Quantum Drug Search (N=16)\n"
+    "Comparison: Speed · Accuracy · Energy · Parallelism · Noise",
+    fontsize=14, fontweight='bold'
+)
+
+ax1 = fig.add_subplot(gs[0, 0])
+states_all = [format(i, '04b') for i in range(N)]
+uniform_prob = [100/N] * N
+after_prob = [optimal_counts.get(s, 0)/SHOTS*100 for s in states_all]
+x = np.arange(N)
+w = 0.38
+b1 = ax1.bar(x - w/2, uniform_prob, w, color='#AED6F1', edgecolor='#2980B9')
+b2 = ax1.bar(x + w/2, after_prob, w, color='#A9DFBF', edgecolor='#27AE60')
+tidx = int(TARGET_STATE, 2)
+b2[tidx].set_color(TG)
+b2[tidx].set_edgecolor('#922B21')
+b2[tidx].set_linewidth(2)
+ax1.set_xticks(x)
+ax1.set_xticklabels(states_all, rotation=60, fontsize=7)
+ax1.set_title('Amplitude Amplification')
+ax1.set_ylabel('Probability (%)')
+
+plt.show()
